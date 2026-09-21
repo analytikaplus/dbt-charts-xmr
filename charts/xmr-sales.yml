@@ -1,0 +1,306 @@
+title: Weekly Sales Control Chart
+notes: Weekly sales monitoring board using XmR-style limits and outlier review.
+source: local_files
+theme: neon
+
+queries:
+  xmr_series:
+    notes: Weekly sales joined to phase-specific XmR center, upper, and lower limits.
+    ignore:
+      - WARN-FANOUT-RISK
+    sql: |
+      WITH RECURSIVE
+      sales_data AS (
+        SELECT
+          ROW_NUMBER() OVER (ORDER BY Date) - 1 AS week_index,
+          Date AS week,
+          CAST(Value AS DOUBLE) AS sales
+        FROM xmr_data
+      ),
+      initial_rows AS (
+        SELECT
+          week_index,
+          sales,
+          LAG(sales) OVER (ORDER BY week_index) AS previous_sales
+        FROM sales_data
+        WHERE week_index <= 8
+      ),
+      initial_stats AS (
+        SELECT
+          AVG(sales) AS center_line,
+          AVG(ABS(sales - previous_sales))
+            FILTER (WHERE previous_sales IS NOT NULL) / 1.128 AS sigma
+        FROM initial_rows
+      ),
+      phase_walk(
+        phase_id,
+        start_index,
+        end_index,
+        center_line,
+        upper_limit,
+        lower_limit,
+        phase_name,
+        next_start
+      ) AS (
+        SELECT
+          1,
+          0,
+          8,
+          center_line,
+          center_line + 3 * sigma,
+          center_line - 3 * sigma,
+          'Initial',
+          9
+        FROM initial_stats
+
+        UNION ALL
+
+        SELECT
+          phase_walk.phase_id + 1,
+          run_info.run_start,
+          run_info.run_end,
+          phase_stats.center_line,
+          phase_stats.center_line + 3 * phase_stats.sigma,
+          phase_stats.center_line - 3 * phase_stats.sigma,
+          'LR' || phase_walk.phase_id,
+          run_info.run_end + 1
+        FROM phase_walk
+        CROSS JOIN LATERAL (
+          WITH data_after AS (
+            SELECT
+              week_index,
+              sales,
+              CASE
+                WHEN sales > phase_walk.center_line THEN 1
+                WHEN sales < phase_walk.center_line THEN -1
+                ELSE 0
+              END AS side
+            FROM sales_data
+            WHERE week_index >= phase_walk.next_start
+          ),
+          run_groups AS (
+            SELECT
+              week_index,
+              side,
+              week_index - ROW_NUMBER() OVER (
+                PARTITION BY side ORDER BY week_index
+              ) AS group_id
+            FROM data_after
+            WHERE side <> 0
+          )
+          SELECT
+            MIN(week_index) AS run_start,
+            MIN(week_index) + 8 AS run_end
+          FROM run_groups
+          GROUP BY side, group_id
+          HAVING COUNT(*) >= 9
+          ORDER BY run_start
+          LIMIT 1
+        ) AS run_info
+        CROSS JOIN LATERAL (
+          WITH run_rows AS (
+            SELECT
+              sales,
+              LAG(sales) OVER (ORDER BY week_index) AS previous_sales
+            FROM sales_data
+            WHERE week_index BETWEEN run_info.run_start AND run_info.run_end
+            )
+            SELECT
+              AVG(sales) AS center_line,
+              AVG(ABS(sales - previous_sales))
+                FILTER (WHERE previous_sales IS NOT NULL) / 1.128 AS sigma
+            FROM run_rows
+          ) AS phase_stats
+        WHERE run_info.run_start IS NOT NULL
+          AND phase_walk.next_start < (SELECT MAX(week_index) FROM sales_data)
+      ),
+      all_phases AS (
+        SELECT
+          phase_id,
+          start_index,
+          end_index,
+          center_line,
+          upper_limit,
+          lower_limit,
+          phase_name
+        FROM phase_walk
+
+        UNION ALL
+
+        SELECT
+          phase_walk.phase_id + 0.5,
+          phase_walk.end_index + 1,
+          COALESCE(next_phase.start_index - 1, max_week.max_index),
+          phase_walk.center_line,
+          phase_walk.upper_limit,
+          phase_walk.lower_limit,
+          'Transition'
+        FROM phase_walk
+        LEFT JOIN phase_walk AS next_phase
+          ON next_phase.phase_id = phase_walk.phase_id + 1
+        CROSS JOIN (
+          SELECT MAX(week_index) AS max_index FROM sales_data
+        ) AS max_week
+        WHERE phase_walk.end_index + 1
+          <= COALESCE(next_phase.start_index - 1, max_week.max_index)
+      )
+      SELECT
+        sales_data.week,
+        sales_data.week_index,
+        sales_data.sales,
+        all_phases.phase_name,
+        all_phases.center_line,
+        all_phases.upper_limit,
+        all_phases.lower_limit,
+        CASE
+          WHEN sales_data.sales > all_phases.upper_limit
+            OR sales_data.sales < all_phases.lower_limit
+          THEN 1
+          ELSE 0
+        END AS is_outlier,
+        CASE
+          WHEN sales_data.sales > all_phases.upper_limit
+            OR sales_data.sales < all_phases.lower_limit
+          THEN 'Outlier'
+          ELSE 'In control'
+        END AS status
+      FROM sales_data
+      JOIN all_phases
+        ON sales_data.week_index BETWEEN all_phases.start_index
+        AND all_phases.end_index
+      ORDER BY sales_data.week_index
+
+  xmr_summary:
+    notes: One-row summary of observations, sales level, peak, and XmR outliers.
+    sql: |
+      SELECT
+        COUNT(*) AS observations,
+        AVG(sales) AS average_sales,
+        MAX(sales) AS peak_sales,
+        SUM(is_outlier) AS outlier_count
+      FROM {{ queries.xmr_series }}
+
+  xmr_outliers:
+    notes: XmR observations outside their phase-specific control limits.
+    sql: |
+      SELECT
+        week,
+        sales,
+        phase_name,
+        upper_limit,
+        lower_limit
+      FROM {{ queries.xmr_series }}
+      WHERE is_outlier = 1
+      ORDER BY week
+
+charts:
+  observations_kpi:
+    notes: Counts weekly observations included in the board.
+    type: kpi
+    query: xmr_summary
+    label: Weekly observations
+    value: observations
+    style:
+      value:
+        format: integer
+
+  average_sales_kpi:
+    notes: Mean weekly sales across the full observation window.
+    type: kpi
+    query: xmr_summary
+    label: Average weekly sales
+    value: average_sales
+    style:
+      value:
+        format: number
+
+  peak_sales_kpi:
+    notes: Maximum weekly sales value in the source data.
+    type: kpi
+    query: xmr_summary
+    label: Peak weekly sales
+    value: peak_sales
+    style:
+      value:
+        format: number
+
+  outlier_count_kpi:
+    notes: Count of observations beyond their phase-specific XmR limits.
+    type: kpi
+    query: xmr_summary
+    label: XmR outliers
+    value: outlier_count
+    style:
+      value:
+        format: integer
+
+  xmr_control:
+    notes: Shows weekly sales against phase-specific XmR center and control limits.
+    type: line
+    query: xmr_series
+    title: XmR control limits by week
+    x: week
+    y: sales
+    height: 460
+    layers:
+      - type: line
+        y: center_line
+        label: Center line
+        style:
+          marks:
+            line:
+              curve: step
+      - type: line
+        y: upper_limit
+        label: Upper limit
+        style:
+          marks:
+            line:
+              curve: step
+              stroke:
+                color: dbt-grays.subtitle
+      - type: line
+        y: lower_limit
+        label: Lower limit
+        style:
+          marks:
+            line:
+              curve: step
+              stroke:
+                color: dbt-grays.subtitle
+      - type: scatter
+        query: xmr_outliers
+        y: sales
+        label: Outliers
+        style:
+          marks:
+            point:
+              color: negative.solid
+    style:
+      number_format: number
+
+  xmr_outlier_table:
+    notes: Exact dates, values, phases, and limits for flagged XmR observations.
+    type: table
+    query: xmr_outliers
+    title: XmR outlier detail
+    style:
+      columns:
+        week:
+          label: Week
+        sales:
+          label: Sales
+          format: number
+        phase_name:
+          label: Phase
+        upper_limit:
+          label: Upper limit
+          format: number
+        lower_limit:
+          label: Lower limit
+          format: number
+
+rows:
+  - cols: [observations_kpi, average_sales_kpi, peak_sales_kpi, outlier_count_kpi]
+  - xmr_control
+  - xmr_outlier_table
